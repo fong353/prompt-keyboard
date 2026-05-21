@@ -1,0 +1,21 @@
+# Swift build
+.build/
+.swiftpm/
+Package.resolved
+
+# Output bundle
+*.app/
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+xcuserdata/
+
+# macOS
+.DS_Store
+*.icns
+
+# Logs / scratch
+*.log
+/tmp/
