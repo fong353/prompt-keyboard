@@ -220,7 +220,7 @@ private struct PromptButton: View {
                     }
                     return
                 }
-                InputSender.send(prompt.content, autoEnter: prompt.autoEnter, toPID: binding.pid, clickOffset: binding.clickOffset)
+                InputSender.send(prompt.content, autoEnter: prompt.autoEnter, toPID: binding.pid, clickPosition: binding.clickPosition)
                 withAnimation(.easeOut(duration: 0.12)) { flashed = true }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                     withAnimation(.easeIn(duration: 0.18)) { flashed = false }

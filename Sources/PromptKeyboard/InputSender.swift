@@ -4,31 +4,40 @@ import Carbon.HIToolbox
 
 enum InputSender {
     /// 纯前台方案:假设目标 App 已经在前台。
-    /// 1. 在绑定时记下的输入框位置上 postToPid 模拟 click(鼠标光标不动,只投递事件给目标进程)
+    /// 1. 在标定的绝对屏幕坐标上 postToPid 模拟 click(鼠标光标不动,事件只投递给目标进程)
     /// 2. postToPid 投递 ⌘V 把剪贴板内容粘进去
     /// 3. autoEnter 再投递回车
     /// - Parameters:
     ///   - autoEnter: 粘贴完是否再敲一次回车
     ///   - toPID: 给了 PID 就用 postToPid 投递到该进程;为 nil 时走 cghidEventTap 打到当前 keyWindow
-    ///   - clickOffset: 绑定时记下的输入框相对主窗口左上角的 offset
-    static func send(_ text: String, autoEnter: Bool, toPID: pid_t? = nil, clickOffset: CGPoint? = nil) {
+    ///   - clickPosition: 标定时记下的输入框绝对屏幕坐标 (CG/AX,top-left of primary)
+    static func send(_ text: String, autoEnter: Bool, toPID: pid_t? = nil, clickPosition: CGPoint? = nil) {
         ensureAccessibilityPermission()
+
+        // 记下原鼠标位置 — 发送完恢复回去,用户不会丢光标
+        let originalCursor = CGEvent(source: nil)?.location
 
         let pb = NSPasteboard.general
         let previous = pb.string(forType: .string)
         pb.clearContents()
         pb.setString(text, forType: .string)
 
-        // 第 1 步:在输入框位置 click 让它获得 first responder
-        if let pid = toPID, let offset = clickOffset {
-            clickWindowOffset(pid: pid, offset: offset)
+        // 第 1 步:在标定位置真实 click — 鼠标会跳过去,你能看到 click 实际落点
+        if let _ = toPID, let point = clickPosition {
+            clickAt(point: point)
         }
 
         // 第 2 步:短延迟后发 ⌘V
-        let pasteDelay = (toPID != nil && clickOffset != nil) ? 0.06 : 0.05
+        let pasteDelay = (toPID != nil && clickPosition != nil) ? 0.10 : 0.05
         DispatchQueue.main.asyncAfter(deadline: .now() + pasteDelay) {
             postCmdV(toPID: toPID)
             let restore = {
+                // 把鼠标移回原位置
+                if let orig = originalCursor {
+                    let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                                       mouseCursorPosition: orig, mouseButton: .left)
+                    move?.post(tap: .cghidEventTap)
+                }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                     restorePasteboard(previous)
                 }
@@ -81,31 +90,19 @@ enum InputSender {
         }
     }
 
-    /// 读目标 App 当前主窗口位置 + offset 得到 click 点,postToPid 模拟左键单击
-    /// 因为是 postToPid 而不是 cghidEventTap,用户的硬件鼠标光标不会移动
-    private static func clickWindowOffset(pid: pid_t, offset: CGPoint) {
-        let axApp = AXUIElementCreateApplication(pid)
-        var mainWindowRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(axApp, kAXMainWindowAttribute as CFString, &mainWindowRef) == .success,
-              let mainWindow = mainWindowRef else { return }
-        var posRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(mainWindow as! AXUIElement, kAXPositionAttribute as CFString, &posRef) == .success,
-              let pRef = posRef else { return }
-        var windowPos = CGPoint.zero
-        AXValueGetValue(pRef as! AXValue, .cgPoint, &windowPos)
-
-        let clickPoint = CGPoint(x: windowPos.x + offset.x, y: windowPos.y + offset.y)
-
+    /// 在绝对屏幕坐标上模拟真实左键单击 — 走 cghidEventTap,鼠标会真跳过去,
+    /// 这样命中是真实命中,所有 app 都会按 hit testing 处理。send() 末尾会把鼠标移回原位置。
+    private static func clickAt(point: CGPoint) {
         // privateState 不继承硬件修饰键,避免 Ctrl+click 被误判为右键
         let src = CGEventSource(stateID: .privateState)
         let down = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown,
-                           mouseCursorPosition: clickPoint, mouseButton: .left)
+                           mouseCursorPosition: point, mouseButton: .left)
         let up = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp,
-                         mouseCursorPosition: clickPoint, mouseButton: .left)
+                         mouseCursorPosition: point, mouseButton: .left)
         down?.flags = []
         up?.flags = []
-        down?.postToPid(pid)
-        up?.postToPid(pid)
+        down?.post(tap: .cghidEventTap)
+        up?.post(tap: .cghidEventTap)
     }
 
     /// 第一次调用时会触发系统弹窗:申请"辅助功能"权限

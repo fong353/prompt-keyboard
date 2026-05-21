@@ -29,21 +29,22 @@ final class BindingState: ObservableObject {
     @Published var appName: String?
     @Published var bundleID: String?
 
-    /// 用户标定时点击的位置,相对目标 app 主窗口左上角的 offset
-    @Published var clickOffset: CGPoint?
+    /// 用户标定时点击的绝对屏幕坐标(AX/CG 坐标系,top-left of primary)
+    /// 直接存绝对值,不算窗口相对 offset — 简单可靠,窗口移动了重新标定一次即可
+    @Published var clickPosition: CGPoint?
 
     /// 是否处于"等待用户在目标输入框点击"的标定模式
     @Published var isCalibrating: Bool = false
 
     private var calibrationMonitor: Any?
 
-    var isBound: Bool { pid != nil && clickOffset != nil }
+    var isBound: Bool { pid != nil && clickPosition != nil }
 
     func unbind() {
         pid = nil
         appName = nil
         bundleID = nil
-        clickOffset = nil
+        clickPosition = nil
         cancelCalibration()
     }
 
@@ -65,9 +66,9 @@ final class BindingState: ObservableObject {
         isCalibrating = false
     }
 
-    /// 把 click 当时的 frontmost app + 屏幕位置 转成 (pid, name, bundleID, clickOffset) 存起来
+    /// 把 click 当时的 frontmost app + 屏幕位置存为绑定
     private func captureClick() {
-        // 这一刻先抓鼠标位置 — NSEvent 坐标系是 bottom-left origin
+        // 这一刻先抓鼠标位置 — NSEvent 坐标系是 bottom-left origin of primary screen
         let mouseLocBL = NSEvent.mouseLocation
         cancelCalibration()
 
@@ -78,27 +79,15 @@ final class BindingState: ObservableObject {
                   app.bundleIdentifier != Bundle.main.bundleIdentifier
             else { return }
 
-            // NSEvent BL → AX/CG TL: y 翻转,以主屏高度为参照
-            let mainScreenHeight = NSScreen.main?.frame.height ?? 0
-            let mouseLocTL = CGPoint(x: mouseLocBL.x, y: mainScreenHeight - mouseLocBL.y)
-
-            // 读 target app 主窗口左上角
-            var windowPos = CGPoint.zero
-            let axApp = AXUIElementCreateApplication(app.processIdentifier)
-            var mwRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(axApp, kAXMainWindowAttribute as CFString, &mwRef) == .success,
-               let mw = mwRef {
-                var posRef: CFTypeRef?
-                if AXUIElementCopyAttributeValue(mw as! AXUIElement, kAXPositionAttribute as CFString, &posRef) == .success,
-                   let pRef = posRef {
-                    AXValueGetValue(pRef as! AXValue, .cgPoint, &windowPos)
-                }
-            }
+            // NSEvent BL → CG/AX TL — 用 CGMainDisplayID 拿 primary screen 高度,
+            // NSScreen.main 在多屏 / 当前 key window 不在 primary 时可能给错的屏
+            let primaryHeight = CGDisplayBounds(CGMainDisplayID()).height
+            let mouseLocTL = CGPoint(x: mouseLocBL.x, y: primaryHeight - mouseLocBL.y)
 
             self.pid = app.processIdentifier
             self.appName = app.localizedName
             self.bundleID = app.bundleIdentifier
-            self.clickOffset = CGPoint(x: mouseLocTL.x - windowPos.x, y: mouseLocTL.y - windowPos.y)
+            self.clickPosition = mouseLocTL
         }
     }
 
@@ -212,14 +201,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             var found: Prompt?
             var targetPID: pid_t?
-            var targetOffset: CGPoint?
+            var targetPosition: CGPoint?
             var bindAlive = true
             DispatchQueue.main.sync {
                 found = self.store.prompts.first { $0.id == id }
                 if self.binding.isBound {
                     bindAlive = self.binding.validate()
                     targetPID = self.binding.pid
-                    targetOffset = self.binding.clickOffset
+                    targetPosition = self.binding.clickPosition
                 }
             }
             guard let prompt = found else { return .notFound() }
@@ -232,7 +221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             DispatchQueue.main.async {
-                InputSender.send(prompt.content, autoEnter: prompt.autoEnter, toPID: targetPID, clickOffset: targetOffset)
+                InputSender.send(prompt.content, autoEnter: prompt.autoEnter, toPID: targetPID, clickPosition: targetPosition)
             }
             return .json(["ok": true])
 
