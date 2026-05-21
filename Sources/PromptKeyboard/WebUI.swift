@@ -32,7 +32,6 @@ enum WebUI {
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .status { font-size: 12px; color: var(--sub); }
   .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; padding: 12px; }
-  @media (min-width: 480px) { .grid { grid-template-columns: repeat(3, 1fr); } }
   .btn { background: var(--card); border: none; color: var(--text);
     padding: 18px 12px; border-radius: 14px; font-size: 16px;
     text-align: center; cursor: pointer; transition: transform .08s, background .12s;
