@@ -100,6 +100,7 @@ struct ContentView: View {
                 ForEach(store.prompts) { prompt in
                     PromptButton(prompt: prompt, binding: binding)
                 }
+                AddCardButton()
             }
             .padding(8)
         }
@@ -174,8 +175,10 @@ private struct QRView: View {
 private struct PromptButton: View {
     let prompt: Prompt
     @ObservedObject var binding: BindingState
+    @EnvironmentObject var store: PromptStore
     @State private var flashed = false
     @State private var error = false
+    @State private var editing = false
 
     var body: some View {
         Button {
@@ -206,12 +209,135 @@ private struct PromptButton: View {
         }
         .buttonStyle(.bordered)
         .help(helpText)
+        .contextMenu {
+            Button("编辑…") { editing = true }
+            Button("复制") { store.duplicate(id: prompt.id) }
+            Divider()
+            Button("上移") { store.moveUp(id: prompt.id) }
+            Button("下移") { store.moveDown(id: prompt.id) }
+            Divider()
+            Button("删除", role: .destructive) { store.delete(id: prompt.id) }
+        }
+        .popover(isPresented: $editing, arrowEdge: .bottom) {
+            PromptEditPopover(prompt: prompt, isPresented: $editing)
+                .environmentObject(store)
+        }
     }
 
     private var helpText: String {
         var s = prompt.content
         if prompt.autoEnter { s += "\n(自动回车)" }
         if let name = binding.appName { s += "\n→ \(name)" }
+        s += "\n(右键编辑)"
         return s
+    }
+}
+
+private struct AddCardButton: View {
+    @EnvironmentObject var store: PromptStore
+    @State private var editingID: UUID?
+
+    var body: some View {
+        Button {
+            let new = Prompt(title: "新提示词", content: "")
+            store.add(new)
+            editingID = new.id
+        } label: {
+            Image(systemName: "plus")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(
+                            style: StrokeStyle(lineWidth: 1, dash: [4, 3])
+                        )
+                        .foregroundStyle(.quaternary)
+                )
+        }
+        .buttonStyle(.plain)
+        .help("新增提示词")
+        .popover(
+            isPresented: Binding(
+                get: { editingID != nil },
+                set: { if !$0 { editingID = nil } }
+            ),
+            arrowEdge: .bottom
+        ) {
+            if let id = editingID,
+               let p = store.prompts.first(where: { $0.id == id }) {
+                PromptEditPopover(
+                    prompt: p,
+                    isPresented: Binding(
+                        get: { editingID != nil },
+                        set: { if !$0 { editingID = nil } }
+                    )
+                )
+                .environmentObject(store)
+            }
+        }
+    }
+}
+
+private struct PromptEditPopover: View {
+    let prompt: Prompt
+    @Binding var isPresented: Bool
+    @EnvironmentObject var store: PromptStore
+    @State private var title: String = ""
+    @State private var content: String = ""
+    @State private var autoEnter: Bool = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("名称")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField("按钮显示的名称", text: $title)
+                .textFieldStyle(.roundedBorder)
+
+            Text("内容")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ZStack(alignment: .topLeading) {
+                if content.isEmpty {
+                    Text("点击后发送的文本…")
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 8)
+                        .padding(.leading, 5)
+                        .allowsHitTesting(false)
+                }
+                TextEditor(text: $content)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(minHeight: 100)
+                    .scrollContentBackground(.hidden)
+            }
+            .overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(.quaternary, lineWidth: 1)
+            )
+
+            Toggle("发送后自动按回车", isOn: $autoEnter)
+
+            HStack {
+                Spacer()
+                Button("完成") {
+                    var updated = prompt
+                    updated.title = title
+                    updated.content = content
+                    updated.autoEnter = autoEnter
+                    store.update(updated)
+                    isPresented = false
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(14)
+        .frame(width: 320)
+        .onAppear {
+            title = prompt.title
+            content = prompt.content
+            autoEnter = prompt.autoEnter
+        }
     }
 }

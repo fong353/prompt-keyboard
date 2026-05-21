@@ -40,6 +40,27 @@ final class PromptStore: ObservableObject {
         prompts.move(fromOffsets: src, toOffset: dst)
     }
 
+    func duplicate(id: UUID) {
+        guard let idx = prompts.firstIndex(where: { $0.id == id }) else { return }
+        var copy = prompts[idx]
+        copy.id = UUID()
+        prompts.insert(copy, at: idx + 1)
+    }
+
+    func moveUp(id: UUID) {
+        guard let idx = prompts.firstIndex(where: { $0.id == id }), idx > 0 else { return }
+        prompts.swapAt(idx, idx - 1)
+    }
+
+    func moveDown(id: UUID) {
+        guard let idx = prompts.firstIndex(where: { $0.id == id }), idx < prompts.count - 1 else { return }
+        prompts.swapAt(idx, idx + 1)
+    }
+
+    func delete(id: UUID) {
+        prompts.removeAll { $0.id == id }
+    }
+
     private func save() {
         guard let data = try? JSONEncoder().encode(prompts) else { return }
         UserDefaults.standard.set(data, forKey: storageKey)
