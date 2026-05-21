@@ -22,37 +22,84 @@ final class NetworkInfo: ObservableObject {
     }
 }
 
-/// 持有"按按钮要把按键打到哪个进程"的目标 PID
-/// 不绑定时为 nil,按按钮会发给当前 keyWindow(回到默认行为)
+/// 持有"按按钮要把按键打到哪个进程"的目标 PID + 用户自己标定的输入框位置
+/// 不绑定时按按钮会发给当前 keyWindow(回到默认行为)
 final class BindingState: ObservableObject {
     @Published var pid: pid_t?
     @Published var appName: String?
     @Published var bundleID: String?
 
-    /// 绑定那一刻 Claude focused element(输入框)相对主窗口左上角的偏移。
-    /// 发送时 click 这个 offset + 当前主窗口位置,让输入框拿到 first responder。
-    /// 用 offset 而不是绝对坐标 — 这样 Claude 窗口移动也能跟上。
+    /// 用户标定时点击的位置,相对目标 app 主窗口左上角的 offset
     @Published var clickOffset: CGPoint?
 
-    var isBound: Bool { pid != nil }
+    /// 是否处于"等待用户在目标输入框点击"的标定模式
+    @Published var isCalibrating: Bool = false
 
-    /// 用当前 frontmost app 作为绑定目标(排除自己),并记下它当前 focused 元素位置
-    func bindToFrontmost() {
-        guard let app = NSWorkspace.shared.frontmostApplication else { return }
-        let myBID = Bundle.main.bundleIdentifier
-        if let bid = app.bundleIdentifier, bid == myBID { return }
-        let p = app.processIdentifier
-        pid = p
-        appName = app.localizedName
-        bundleID = app.bundleIdentifier
-        clickOffset = computeFocusedElementOffset(pid: p)
-    }
+    private var calibrationMonitor: Any?
+
+    var isBound: Bool { pid != nil && clickOffset != nil }
 
     func unbind() {
         pid = nil
         appName = nil
         bundleID = nil
         clickOffset = nil
+        cancelCalibration()
+    }
+
+    /// 启动"标定位置"流程:监听下一次全局 left mouse down,
+    /// 把那一刻的 frontmost app + click 位置存为绑定
+    func startCalibration() {
+        guard !isCalibrating else { return }
+        isCalibrating = true
+        calibrationMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
+            self?.captureClick()
+        }
+    }
+
+    func cancelCalibration() {
+        if let m = calibrationMonitor {
+            NSEvent.removeMonitor(m)
+            calibrationMonitor = nil
+        }
+        isCalibrating = false
+    }
+
+    /// 把 click 当时的 frontmost app + 屏幕位置 转成 (pid, name, bundleID, clickOffset) 存起来
+    private func captureClick() {
+        // 这一刻先抓鼠标位置 — NSEvent 坐标系是 bottom-left origin
+        let mouseLocBL = NSEvent.mouseLocation
+        cancelCalibration()
+
+        // 等 100ms 让 click 真的把 target app 切前台,再读 frontmost
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self = self,
+                  let app = NSWorkspace.shared.frontmostApplication,
+                  app.bundleIdentifier != Bundle.main.bundleIdentifier
+            else { return }
+
+            // NSEvent BL → AX/CG TL: y 翻转,以主屏高度为参照
+            let mainScreenHeight = NSScreen.main?.frame.height ?? 0
+            let mouseLocTL = CGPoint(x: mouseLocBL.x, y: mainScreenHeight - mouseLocBL.y)
+
+            // 读 target app 主窗口左上角
+            var windowPos = CGPoint.zero
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            var mwRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(axApp, kAXMainWindowAttribute as CFString, &mwRef) == .success,
+               let mw = mwRef {
+                var posRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(mw as! AXUIElement, kAXPositionAttribute as CFString, &posRef) == .success,
+                   let pRef = posRef {
+                    AXValueGetValue(pRef as! AXValue, .cgPoint, &windowPos)
+                }
+            }
+
+            self.pid = app.processIdentifier
+            self.appName = app.localizedName
+            self.bundleID = app.bundleIdentifier
+            self.clickOffset = CGPoint(x: mouseLocTL.x - windowPos.x, y: mouseLocTL.y - windowPos.y)
+        }
     }
 
     /// 绑定的进程是否还活着,死了清掉绑定并返回 false
@@ -64,38 +111,6 @@ final class BindingState: ObservableObject {
             return false
         }
         return true
-    }
-
-    /// 读 frontmost focused element 的中心位置,以及 main window 左上角,返回 offset
-    private func computeFocusedElementOffset(pid: pid_t) -> CGPoint? {
-        let axApp = AXUIElementCreateApplication(pid)
-
-        // 1. main window 左上角
-        var mainWindowRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(axApp, kAXMainWindowAttribute as CFString, &mainWindowRef) == .success,
-              let mainWindow = mainWindowRef else { return nil }
-        var windowPosRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(mainWindow as! AXUIElement, kAXPositionAttribute as CFString, &windowPosRef) == .success,
-              let wpRef = windowPosRef else { return nil }
-        var windowPos = CGPoint.zero
-        AXValueGetValue(wpRef as! AXValue, .cgPoint, &windowPos)
-
-        // 2. focused element 的中心 (global screen)
-        var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
-              let focused = focusedRef else { return nil }
-        var elPosRef: CFTypeRef?
-        var elSizeRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(focused as! AXUIElement, kAXPositionAttribute as CFString, &elPosRef) == .success,
-              AXUIElementCopyAttributeValue(focused as! AXUIElement, kAXSizeAttribute as CFString, &elSizeRef) == .success,
-              let epRef = elPosRef, let esRef = elSizeRef else { return nil }
-        var elPos = CGPoint.zero
-        var elSize = CGSize.zero
-        AXValueGetValue(epRef as! AXValue, .cgPoint, &elPos)
-        AXValueGetValue(esRef as! AXValue, .cgSize, &elSize)
-        let elCenter = CGPoint(x: elPos.x + elSize.width / 2, y: elPos.y + elSize.height / 2)
-
-        return CGPoint(x: elCenter.x - windowPos.x, y: elCenter.y - windowPos.y)
     }
 }
 

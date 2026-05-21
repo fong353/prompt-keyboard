@@ -52,7 +52,21 @@ struct ContentView: View {
 
     private var bindingBar: some View {
         HStack(spacing: 6) {
-            if binding.isBound {
+            if binding.isCalibrating {
+                Image(systemName: "scope")
+                    .foregroundStyle(.orange)
+                Text("到目标输入框里点一下…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    binding.cancelCalibration()
+                } label: {
+                    Text("取消").font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            } else if binding.isBound {
                 Image(systemName: "scope")
                     .foregroundStyle(.green)
                 Text(binding.appName ?? "")
@@ -79,14 +93,13 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button {
-                    binding.bindToFrontmost()
+                    binding.startCalibration()
                 } label: {
-                    Text("绑定")
-                        .font(.caption)
+                    Text("标定位置").font(.caption)
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .help("绑定前先在目标 App 里点一下输入框(光标在闪),再点这里")
+                .help("点这里后,到目标 App 的输入框里点一下 — PromptKeyboard 会记下那个位置")
             }
         }
         .padding(.horizontal, 12)
