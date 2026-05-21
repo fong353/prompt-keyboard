@@ -30,11 +30,13 @@ struct ContentView: View {
     }
 
     private var header: some View {
-        HStack {
+        HStack(spacing: 8) {
             Image(systemName: "keyboard")
             Text("提示词键盘")
                 .font(.headline)
             Spacer()
+            TemplateMenu()
+                .environmentObject(store)
             Button {
                 showEditor = true
             } label: {
@@ -84,7 +86,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .help("绑定当前激活的窗口为目标")
+                .help("绑定前先在目标 App 里点一下输入框(光标在闪),再点这里")
             }
         }
         .padding(.horizontal, 12)
@@ -181,33 +183,49 @@ private struct PromptButton: View {
     @State private var editing = false
 
     var body: some View {
-        Button {
-            // 绑定的进程死了就拒绝发送并红闪一下
-            if binding.isBound && !binding.validate() {
-                withAnimation(.easeOut(duration: 0.12)) { error = true }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                    withAnimation(.easeIn(duration: 0.2)) { error = false }
+        HStack(spacing: 0) {
+            // 左侧拖动手柄 — 只在它上面 draggable,主按钮的点击不受影响
+            Image(systemName: "line.3.horizontal")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .frame(width: 14)
+                .frame(maxHeight: .infinity)
+                .contentShape(Rectangle())
+                .help("按住拖动可重新排序")
+                .draggable(prompt.id.uuidString) {
+                    Text(prompt.title)
+                        .padding(6)
+                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 6))
                 }
-                return
+
+            Button {
+                // 绑定的进程死了就拒绝发送并红闪一下
+                if binding.isBound && !binding.validate() {
+                    withAnimation(.easeOut(duration: 0.12)) { error = true }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                        withAnimation(.easeIn(duration: 0.2)) { error = false }
+                    }
+                    return
+                }
+                InputSender.send(prompt.content, autoEnter: prompt.autoEnter, toPID: binding.pid, clickOffset: binding.clickOffset)
+                withAnimation(.easeOut(duration: 0.12)) { flashed = true }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    withAnimation(.easeIn(duration: 0.18)) { flashed = false }
+                }
+            } label: {
+                Text(prompt.title)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(
+                        error ? Color.red.opacity(0.4) :
+                        flashed ? Color.accentColor.opacity(0.35) : Color.clear
+                    )
+                    .cornerRadius(6)
             }
-            InputSender.send(prompt.content, autoEnter: prompt.autoEnter, toPID: binding.pid)
-            withAnimation(.easeOut(duration: 0.12)) { flashed = true }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                withAnimation(.easeIn(duration: 0.18)) { flashed = false }
-            }
-        } label: {
-            Text(prompt.title)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background(
-                    error ? Color.red.opacity(0.4) :
-                    flashed ? Color.accentColor.opacity(0.35) : Color.clear
-                )
-                .cornerRadius(6)
+            .buttonStyle(.bordered)
         }
-        .buttonStyle(.bordered)
         .help(helpText)
         .contextMenu {
             Button("编辑…") { editing = true }
@@ -221,6 +239,11 @@ private struct PromptButton: View {
         .popover(isPresented: $editing, arrowEdge: .bottom) {
             PromptEditPopover(prompt: prompt, isPresented: $editing)
                 .environmentObject(store)
+        }
+        .dropDestination(for: String.self) { items, _ in
+            guard let raw = items.first, let dropped = UUID(uuidString: raw) else { return false }
+            store.move(id: dropped, before: prompt.id)
+            return true
         }
     }
 
@@ -257,7 +280,12 @@ private struct AddCardButton: View {
                 )
         }
         .buttonStyle(.plain)
-        .help("新增提示词")
+        .help("新增提示词 · 拖卡片到这里 = 移到末尾")
+        .dropDestination(for: String.self) { items, _ in
+            guard let raw = items.first, let dropped = UUID(uuidString: raw) else { return false }
+            store.moveToEnd(id: dropped)
+            return true
+        }
         .popover(
             isPresented: Binding(
                 get: { editingID != nil },
@@ -339,5 +367,42 @@ private struct PromptEditPopover: View {
             content = prompt.content
             autoEnter = prompt.autoEnter
         }
+    }
+}
+
+private struct TemplateMenu: View {
+    @EnvironmentObject var store: PromptStore
+
+    var body: some View {
+        Menu {
+            ForEach(PromptTemplates.groups) { group in
+                Menu {
+                    Button("全部导入") {
+                        for t in group.items {
+                            store.add(Prompt(title: t.title, content: t.content, autoEnter: t.autoEnter))
+                        }
+                    }
+                    Divider()
+                    ForEach(group.items) { p in
+                        Button("\(p.title) — \(preview(p.content))") {
+                            store.add(Prompt(title: p.title, content: p.content, autoEnter: p.autoEnter))
+                        }
+                    }
+                } label: {
+                    Label(group.name, systemImage: group.icon)
+                }
+            }
+        } label: {
+            Image(systemName: "square.grid.2x2")
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("从模板库添加")
+    }
+
+    private func preview(_ s: String) -> String {
+        let line = s.replacingOccurrences(of: "\n", with: " ")
+        return line.count > 24 ? String(line.prefix(24)) + "…" : line
     }
 }

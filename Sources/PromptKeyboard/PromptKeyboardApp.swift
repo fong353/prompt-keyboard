@@ -29,22 +29,30 @@ final class BindingState: ObservableObject {
     @Published var appName: String?
     @Published var bundleID: String?
 
+    /// 绑定那一刻 Claude focused element(输入框)相对主窗口左上角的偏移。
+    /// 发送时 click 这个 offset + 当前主窗口位置,让输入框拿到 first responder。
+    /// 用 offset 而不是绝对坐标 — 这样 Claude 窗口移动也能跟上。
+    @Published var clickOffset: CGPoint?
+
     var isBound: Bool { pid != nil }
 
-    /// 用当前 frontmost app 作为绑定目标(排除自己)
+    /// 用当前 frontmost app 作为绑定目标(排除自己),并记下它当前 focused 元素位置
     func bindToFrontmost() {
         guard let app = NSWorkspace.shared.frontmostApplication else { return }
         let myBID = Bundle.main.bundleIdentifier
         if let bid = app.bundleIdentifier, bid == myBID { return }
-        pid = app.processIdentifier
+        let p = app.processIdentifier
+        pid = p
         appName = app.localizedName
         bundleID = app.bundleIdentifier
+        clickOffset = computeFocusedElementOffset(pid: p)
     }
 
     func unbind() {
         pid = nil
         appName = nil
         bundleID = nil
+        clickOffset = nil
     }
 
     /// 绑定的进程是否还活着,死了清掉绑定并返回 false
@@ -56,6 +64,38 @@ final class BindingState: ObservableObject {
             return false
         }
         return true
+    }
+
+    /// 读 frontmost focused element 的中心位置,以及 main window 左上角,返回 offset
+    private func computeFocusedElementOffset(pid: pid_t) -> CGPoint? {
+        let axApp = AXUIElementCreateApplication(pid)
+
+        // 1. main window 左上角
+        var mainWindowRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXMainWindowAttribute as CFString, &mainWindowRef) == .success,
+              let mainWindow = mainWindowRef else { return nil }
+        var windowPosRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(mainWindow as! AXUIElement, kAXPositionAttribute as CFString, &windowPosRef) == .success,
+              let wpRef = windowPosRef else { return nil }
+        var windowPos = CGPoint.zero
+        AXValueGetValue(wpRef as! AXValue, .cgPoint, &windowPos)
+
+        // 2. focused element 的中心 (global screen)
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+              let focused = focusedRef else { return nil }
+        var elPosRef: CFTypeRef?
+        var elSizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(focused as! AXUIElement, kAXPositionAttribute as CFString, &elPosRef) == .success,
+              AXUIElementCopyAttributeValue(focused as! AXUIElement, kAXSizeAttribute as CFString, &elSizeRef) == .success,
+              let epRef = elPosRef, let esRef = elSizeRef else { return nil }
+        var elPos = CGPoint.zero
+        var elSize = CGSize.zero
+        AXValueGetValue(epRef as! AXValue, .cgPoint, &elPos)
+        AXValueGetValue(esRef as! AXValue, .cgSize, &elSize)
+        let elCenter = CGPoint(x: elPos.x + elSize.width / 2, y: elPos.y + elSize.height / 2)
+
+        return CGPoint(x: elCenter.x - windowPos.x, y: elCenter.y - windowPos.y)
     }
 }
 
@@ -87,7 +127,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.title = "提示词键盘"
         panel.titlebarAppearsTransparent = true
         panel.titleVisibility = .hidden
-        panel.isMovableByWindowBackground = true
+        // 不让"窗口背景"参与拖窗口 — 否则会抢走卡片手柄的 draggable 手势。
+        // 用户从顶部标题栏区域(透明那一条)依然能拖动整个 panel。
+        panel.isMovableByWindowBackground = false
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -155,12 +197,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             var found: Prompt?
             var targetPID: pid_t?
+            var targetOffset: CGPoint?
             var bindAlive = true
             DispatchQueue.main.sync {
                 found = self.store.prompts.first { $0.id == id }
                 if self.binding.isBound {
                     bindAlive = self.binding.validate()
                     targetPID = self.binding.pid
+                    targetOffset = self.binding.clickOffset
                 }
             }
             guard let prompt = found else { return .notFound() }
@@ -173,7 +217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             DispatchQueue.main.async {
-                InputSender.send(prompt.content, autoEnter: prompt.autoEnter, toPID: targetPID)
+                InputSender.send(prompt.content, autoEnter: prompt.autoEnter, toPID: targetPID, clickOffset: targetOffset)
             }
             return .json(["ok": true])
 

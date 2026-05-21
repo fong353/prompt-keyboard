@@ -8,7 +8,9 @@ enum InputSender {
     ///   - autoEnter: 粘贴完是否再敲一次回车
     ///   - toPID: 如果给了 PID,事件直接投递到该进程(不依赖前台焦点);
     ///            为 nil 时走 cghidEventTap,等同于打到当前 keyWindow
-    static func send(_ text: String, autoEnter: Bool, toPID: pid_t? = nil) {
+    ///   - clickOffset: 绑定时记下的输入框相对主窗口左上角的 offset。
+    ///                  存在时,先 click 这个位置让输入框获得 first responder,再 ⌘V
+    static func send(_ text: String, autoEnter: Bool, toPID: pid_t? = nil, clickOffset: CGPoint? = nil) {
         ensureAccessibilityPermission()
 
         // 抓住按下按钮瞬间的前台 App + 该目标窗口原始是否最小化,
@@ -35,6 +37,13 @@ enum InputSender {
         // 给 activate/unminimize/raise 一点时间生效,再发按键
         let delay = (toPID != nil) ? 0.30 : 0.05
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            // 绑定状态下若记了输入框位置,先 click 一下让输入框拿到 first responder。
+            // click 通过 postToPid 投递,只进目标进程,不会移动用户的硬件鼠标光标
+            if let pid = toPID, let offset = clickOffset {
+                clickWindowOffset(pid: pid, offset: offset)
+            }
+            let postPasteDelay = (toPID != nil && clickOffset != nil) ? 0.06 : 0.0
+            DispatchQueue.main.asyncAfter(deadline: .now() + postPasteDelay) {
             postCmdV(toPID: toPID)
             let afterSend = { (extra: TimeInterval) in
                 DispatchQueue.main.asyncAfter(deadline: .now() + extra) {
@@ -56,6 +65,7 @@ enum InputSender {
                 }
             } else {
                 afterSend(0.25)
+            }
             }
         }
     }
@@ -158,5 +168,32 @@ enum InputSender {
 
         // 3. NSRunningApplication 走 macOS 标准激活路径,把焦点切过去
         NSRunningApplication(processIdentifier: pid)?.activate()
+    }
+
+    /// 读目标 App 当前主窗口的位置,加上 offset 得到 click 点,用 postToPid 模拟 left click。
+    /// 因为 postToPid 不经过硬件 event tap,用户的实际鼠标光标不会移动。
+    private static func clickWindowOffset(pid: pid_t, offset: CGPoint) {
+        let axApp = AXUIElementCreateApplication(pid)
+        var mainWindowRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXMainWindowAttribute as CFString, &mainWindowRef) == .success,
+              let mainWindow = mainWindowRef else { return }
+        var posRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(mainWindow as! AXUIElement, kAXPositionAttribute as CFString, &posRef) == .success,
+              let pRef = posRef else { return }
+        var windowPos = CGPoint.zero
+        AXValueGetValue(pRef as! AXValue, .cgPoint, &windowPos)
+
+        let clickPoint = CGPoint(x: windowPos.x + offset.x, y: windowPos.y + offset.y)
+
+        // 用 privateState 避免继承硬件上正按住的修饰键(防止 Ctrl+click 被解读为右键)
+        let src = CGEventSource(stateID: .privateState)
+        let down = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown,
+                           mouseCursorPosition: clickPoint, mouseButton: .left)
+        let up = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp,
+                         mouseCursorPosition: clickPoint, mouseButton: .left)
+        down?.flags = []
+        up?.flags = []
+        down?.postToPid(pid)
+        up?.postToPid(pid)
     }
 }

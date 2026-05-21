@@ -61,6 +61,24 @@ final class PromptStore: ObservableObject {
         prompts.removeAll { $0.id == id }
     }
 
+    /// 拖拽:把 id 卡片移到 targetID 之前
+    func move(id: UUID, before targetID: UUID) {
+        guard id != targetID,
+              let from = prompts.firstIndex(where: { $0.id == id }),
+              let toRaw = prompts.firstIndex(where: { $0.id == targetID })
+        else { return }
+        let item = prompts.remove(at: from)
+        let to = from < toRaw ? toRaw - 1 : toRaw
+        prompts.insert(item, at: to)
+    }
+
+    /// 拖拽:拖到末尾(拖到 + 卡片或网格末端)
+    func moveToEnd(id: UUID) {
+        guard let from = prompts.firstIndex(where: { $0.id == id }) else { return }
+        let item = prompts.remove(at: from)
+        prompts.append(item)
+    }
+
     private func save() {
         guard let data = try? JSONEncoder().encode(prompts) else { return }
         UserDefaults.standard.set(data, forKey: storageKey)
