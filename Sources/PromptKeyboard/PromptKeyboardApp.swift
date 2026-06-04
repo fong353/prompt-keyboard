@@ -99,8 +99,18 @@ final class TerminalTarget: ObservableObject {
             return -1
         }
         if frontmostPID != lpid {
-            app.activate()
-            return 0.15
+            // NSRunningApplication.activate() 在 macOS 14+ 要求 user-provided event,
+            // 而我们是 nonactivating panel,按钮点击的 event 不算 — 结果 activate 静默失败,
+            // 锁定终端不会被拉前台,⌘V 也粘不进去。`.activateIgnoringOtherApps` 在 14+ 已无效。
+            // 走 LaunchServices(openApplication) 不受这个限制,app 已运行时只 activate 不会重启。
+            if let url = app.bundleURL {
+                let config = NSWorkspace.OpenConfiguration()
+                config.activates = true
+                NSWorkspace.shared.openApplication(at: url, configuration: config, completionHandler: nil)
+            } else {
+                app.activate() // 兜底:拿不到 bundleURL 时退回到原 API
+            }
+            return 0.2
         }
         return nil
     }
