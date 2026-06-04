@@ -84,7 +84,16 @@ codesign --force --deep --sign - "$APP_DIR" 2>&1 | grep -v '^$' || true
 if [ "${1:-}" = "install" ]; then
   echo "→ 复制到 /Applications"
   rm -rf "/Applications/$APP_DIR"
-  cp -R "$APP_DIR" "/Applications/"
+  # 用 ditto 而不是 cp -R:macOS TCC (App Management) 会静默拦截
+  # cp -R 到 /Applications(exit 0 但目录是空壳),ditto 走 copyfile API 可以过
+  ditto "$APP_DIR" "/Applications/$APP_DIR"
+  # 事后校验:可执行文件存在且非空才算装成功
+  if [ ! -x "/Applications/$APP_DIR/Contents/MacOS/$APP_NAME" ]; then
+    echo "✗ 安装失败 — /Applications/$APP_DIR 里没有可执行文件"
+    echo "  可能是 Terminal 没有「App Management」权限。"
+    echo "  系统设置 → 隐私与安全性 → App 管理 → 把当前终端加进去,重试。"
+    exit 1
+  fi
   echo "✓ 已安装到 /Applications/$APP_DIR"
   echo ""
   echo "下一步:"

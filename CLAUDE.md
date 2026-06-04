@@ -82,7 +82,8 @@ osascript -e 'tell application "PromptKeyboard" to quit'; sleep 1
 
 ## 权限
 
-- **辅助功能**: `CGEvent.postToPid` 注入必需。每次 `./build.sh install` ad-hoc 重签名后,授权会失效 — 用户要在系统设置里**删掉再加回**(旧授权对的是旧签名 hash)
+- **辅助功能**: `CGEvent.postToPid` 注入必需。每次 `./build.sh install` ad-hoc 重签名后,授权会失效 — 用户要在系统设置里**删掉再加回**(旧授权对的是旧签名 hash)。app 路径变了(`/Applications` ↔ 项目目录)同理要重加
+- **App 管理 (TCC)**: 装到 `/Applications` 需要 Terminal 有 "App 管理" 权限,否则 `cp -R` 会**静默假成功**(exit 0,目录是空壳)。`build.sh install` 用 `ditto` 而不是 `cp -R` 规避这个 — `ditto` 走 copyfile API 可以过 TCC。事后校验可执行文件存在防止再被骗
 - 网络: HTTP server 在 `8765` 端口,纯局域网
 
 ## HTTP API(手机遥控)
