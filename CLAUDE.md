@@ -47,13 +47,15 @@ osascript -e 'tell application "PromptKeyboard" to quit'; sleep 1
 2. `target.prepareForSend()`:
    - 跟随模式 → 返回 nil,立即发
    - 锁定模式 + frontmost == 锁定 app → 返回 nil,立即发
-   - 锁定模式 + frontmost ≠ 锁定 app → `NSRunningApplication(pid).activate()` 把锁定 app 叫到前台,返回 0.15s 让 activate 生效
+   - 锁定模式 + frontmost ≠ 锁定 app → `NSWorkspace.openApplication(at: bundleURL, configuration:)`(activates=true) 把锁定 app 叫到前台,返回 0.2s 让 activate 生效
    - 锁定的 pid 已死 → 返回 -1,自动解锁,本次放弃
 3. `InputSender.send(text, autoEnter, toPID:)`:`NSPasteboard` 写文本 → `CGEvent.postToPid` 投递 ⌘V → 可选 postToPid Return → 0.15s 后复原原剪贴板
 
-`FloatingPanel` 是 nonactivating panel,点按钮不抢 key window,所以跟随模式下 frontmost 始终是终端本身。锁定模式下用 `activate()` 主动把目标拉到前台是为了 ⌘V 能正确粘到该终端的 key window(后台 app 的 ⌘V 行为不保证)。
+`FloatingPanel` 是 nonactivating panel,点按钮不抢 key window,所以跟随模式下 frontmost 始终是终端本身。锁定模式下主动把目标拉到前台是为了 ⌘V 能正确粘到该终端的 key window(后台 app 的 ⌘V 行为不保证 — 多数 app 的 Paste 菜单项在窗口非 key 时是 disabled)。**注意**: 这里**不能**用 `NSRunningApplication.activate()` — macOS 14+ 它要 user-provided event,nonactivating panel 给不出,会静默失败;`.activateIgnoringOtherApps` Apple 14+ 明文 "will have no effect"。走 `NSWorkspace.openApplication`(LaunchServices)绕过这个限制,target 已运行时只 activate 不会重启。
 
 锁定状态不持久化 — 关 app 重开回到跟随模式。
+
+**锁定的粒度是 app 实例,不是窗口**: iTerm2 / Apple Terminal 都是单进程多窗口架构,N 个窗口/tab 共用一个 pid。锁了 iTerm 后用户在 iTerm 内手动切到另一个窗口,⌘V 会粘到 iTerm 当前的 key window(也就是用户切到的那个),不是按🔒那一刻的窗口。要锁到具体窗口必须改成 AX `AXWindow` ID + 发送前 raise 指定窗口,复杂度上一个量级,目前不做。
 
 **绝对不要**回到这些"看似优雅但被踩死的"思路(历史踩坑,留作警示):
 
@@ -62,6 +64,7 @@ osascript -e 'tell application "PromptKeyboard" to quit'; sleep 1
 - ❌ AX `kAXFocusedAttribute = true` 自动 focus textarea — 即使对终端也没必要(整个窗口都是输入)
 - ❌ `NSScreen.main?.frame.height` 做坐标转换 — 现在压根没有坐标转换了。多屏时 `main` 也可能不是 primary,要用 `CGDisplayBounds(CGMainDisplayID()).height`(已无场景,但同类问题别再犯)
 - ❌ `Button + .draggable` 加在同一个 view — SwiftUI hit testing 冲突,点击会跑到左上角。要拖拽就**单独的拖动手柄 view 上挂 .draggable**
+- ❌ 用 `NSRunningApplication.activate()` / `.activateIgnoringOtherApps` 把外部 app 拉前台 — macOS 14+ 前者要 user-provided event,nonactivating panel 给不出;后者 Apple 明文 "will have no effect"。要拉前台用 `NSWorkspace.shared.openApplication(at: app.bundleURL!, configuration:)`,LaunchServices 不受限,target 已运行时只 activate 不会重启
 
 ## 想加新终端
 
