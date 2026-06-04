@@ -88,7 +88,7 @@ if [ "${1:-}" = "install" ]; then
   echo "✓ 已安装到 /Applications/$APP_DIR"
   echo ""
   echo "下一步:"
-  echo "  1. 打开访达 → 应用程序 → 双击「$APP_NAME」启动"
+  echo "  1. 打开访达 → 应用程序 → 双击「${APP_NAME}」启动"
   echo "  2. 首次启动可能被 Gatekeeper 拦截,在「系统设置 → 隐私与安全性」最下方点「仍要打开」"
   echo "  3. 点悬浮窗按钮时会请求「辅助功能」权限,授权即可"
 else

@@ -4,7 +4,9 @@
 
 ## 是什么
 
-macOS 悬浮窗,把预设 prompts 一键发到 Claude Code / 终端 / 任何 app。同时起一个 LAN HTTP server 让手机当遥控器。
+macOS 悬浮窗,把预设 prompts 一键发到 **终端里跑的 Claude Code CLI**(iTerm2 / Apple Terminal)。同时起一个 LAN HTTP server 让手机当遥控器。
+
+**目标范围明确只覆盖终端 CLI**。Electron / Chromium / 浏览器 / Cursor / Claude Desktop 都不在范围内 — 历史上为了适配它们引入的复杂度(标定位置 / 真实 click / 坐标转换)已经全部砍掉,不要再加回来。
 
 ## 构建
 
@@ -24,36 +26,50 @@ osascript -e 'tell application "PromptKeyboard" to quit'; sleep 1
 
 | 文件 | 干什么 |
 |---|---|
-| `PromptKeyboardApp.swift` | App entry / `AppDelegate` / `BindingState` / `FloatingPanel` / HTTP route |
-| `ContentView.swift` | SwiftUI 主面板 — header / bindingBar / 卡片网格 / footer / 编辑 popover / 模板菜单 |
+| `PromptKeyboardApp.swift` | App entry / `AppDelegate` / `TerminalTarget` / `FloatingPanel` / HTTP route |
+| `ContentView.swift` | SwiftUI 主面板 — header / targetBar / 卡片网格 / footer / 编辑 popover / 模板菜单 |
 | `EditorView.swift` | 编辑器 sheet — 侧栏 List + 详情表单,提供"+ 模板"菜单 |
 | `PromptStore.swift` | `Prompt` model + `PromptStore` (`@Published [Prompt]` 持久化到 UserDefaults) + `PromptTemplates` 预设库 |
-| `InputSender.swift` | 把文本发到目标 app 的核心 — 剪贴板 + click + ⌘V + 回车 |
+| `InputSender.swift` | 把文本发到目标终端的核心 — 剪贴板 + postToPid ⌘V + 回车 |
 | `HTTPServer.swift` | 极简纯 Foundation HTTP server,无第三方依赖 |
 | `WebUI.swift` | 手机端 HTML/CSS/JS(全在一个 Swift 字符串里) |
 
-## 输入路径(核心,**先读这段再改 InputSender**)
+## 输入路径(核心,**先读这段再改 InputSender / TerminalTarget**)
 
-最终方案是**纯前台 + 真实 click**:
+`TerminalTarget` 有两种模式,UI 上由 targetBar 的 🔒/🔓 切换:
 
-1. 标定流程: 用户点"标定位置"→ `NSEvent.addGlobalMonitorForEvents` 捕获下一次 left mouse down → 记当时 frontmost app 的 pid/name/bundleID + 屏幕坐标(NSEvent BL → CG TL 用 `CGMainDisplayID()` 拿 primary 高度做 y 翻转)
-2. 发送: `CGEvent` via `cghidEventTap` 模拟真实左键单击标定位置 → `⌘V` → `Return` → 把鼠标光标移回原位置(用户感觉是光标飞一下又回来)
-3. 不切前台、不还原原前台 app、不持久化 binding — 用户保证目标 app 在前台
+**跟随模式 (默认)**: 目标 = 当前 frontmost。监听 `NSWorkspace.didActivateApplicationNotification` 持续更新 frontmostPID / frontmostBundleID,只有 bundleID 命中白名单(`terminalBundleIDs`,目前 iTerm2 + Terminal)时才允许发送。
 
-**绝对不要**回到这些"看似优雅但被踩死的"思路:
+**锁定模式**: 用户在 frontmost 是终端时点 🔒,把那一刻的 pid/name/bundleID 拷到 lockedXxx。之后 sendPID 始终返回 lockedPID,无论 frontmost 在哪。监听 `didTerminateApplicationNotification`,锁定的 app 退出时自动解锁。
 
-- ❌ `CGEvent.postToPid()` 投递 mouse event — Electron / Chromium app **静默忽略**,click 像没发生,⌘V 跑到菜单栏 Edit。`postToPid` 投递 key event 反而 OK,但用 `cghidEventTap` 已经够了不需要混
-- ❌ AX `kAXFocusedAttribute = true` 设到 textarea — Electron 的 Web 元素不响应
-- ❌ "用 AX 找 focused element 位置" 自动标定 — Electron 报的 position 经常对不上视觉位置(可能跟 `fullSizeContentView` 有关)。**让用户自己点**
-- ❌ `NSScreen.main?.frame.height` 做坐标转换 — 多屏时 `main` 可能不是 primary。**用 `CGDisplayBounds(CGMainDisplayID()).height`**
+发送流程(`PromptButton` + HTTP `/api/send` 共用):
+1. `target.isTerminal == false` 或 `sendPID == nil` → 红闪拒绝
+2. `target.prepareForSend()`:
+   - 跟随模式 → 返回 nil,立即发
+   - 锁定模式 + frontmost == 锁定 app → 返回 nil,立即发
+   - 锁定模式 + frontmost ≠ 锁定 app → `NSRunningApplication(pid).activate()` 把锁定 app 叫到前台,返回 0.15s 让 activate 生效
+   - 锁定的 pid 已死 → 返回 -1,自动解锁,本次放弃
+3. `InputSender.send(text, autoEnter, toPID:)`:`NSPasteboard` 写文本 → `CGEvent.postToPid` 投递 ⌘V → 可选 postToPid Return → 0.15s 后复原原剪贴板
+
+`FloatingPanel` 是 nonactivating panel,点按钮不抢 key window,所以跟随模式下 frontmost 始终是终端本身。锁定模式下用 `activate()` 主动把目标拉到前台是为了 ⌘V 能正确粘到该终端的 key window(后台 app 的 ⌘V 行为不保证)。
+
+锁定状态不持久化 — 关 app 重开回到跟随模式。
+
+**绝对不要**回到这些"看似优雅但被踩死的"思路(历史踩坑,留作警示):
+
+- ❌ 加回"标定位置 + 真实 click"流程 — 终端不需要,只会让用户多一步操作
+- ❌ 用 `cghidEventTap` 投递 ⌘V — 现在 frontmost 就是终端,`postToPid` 已经够,`cghidEventTap` 还会被前台其他可能弹出的 app 截胡
+- ❌ AX `kAXFocusedAttribute = true` 自动 focus textarea — 即使对终端也没必要(整个窗口都是输入)
+- ❌ `NSScreen.main?.frame.height` 做坐标转换 — 现在压根没有坐标转换了。多屏时 `main` 也可能不是 primary,要用 `CGDisplayBounds(CGMainDisplayID()).height`(已无场景,但同类问题别再犯)
 - ❌ `Button + .draggable` 加在同一个 view — SwiftUI hit testing 冲突,点击会跑到左上角。要拖拽就**单独的拖动手柄 view 上挂 .draggable**
 
-## 后台输入(目前未实现)
+## 想加新终端
 
-macOS 在 app 处于后台时基本不让它处理键盘事件,所以"完全后台"做不到。如果要做"目标在后台也能用",方案:
-- `send()` 入口判断 frontmost ≠ 目标 → 记原前台 → `forceBringToFront(target pid)` (AX raise + frontmost + activate) → 等 0.25s → 走当前流程 → 收尾 `originalFrontApp.activate()`
-- 体感: 目标 app "闪一下"
-- 加 ~25 行,**InputSender 不会回到打补丁的复杂度**,因为 click 仍然是 cghidEventTap 真实命中
+只要在 `TerminalTarget.terminalBundleIDs` 加一个 bundle ID 就行(Ghostty = `com.mitchellh.ghostty`,WezTerm = `com.github.wez.wezterm`,kitty = `net.kovidgoyal.kitty`,Warp = `dev.warp.Warp-Stable`,Alacritty = `org.alacritty`)。其他逻辑零改动。
+
+## 想扩到非终端 app(慎重)
+
+如果哪天又要发到 Electron / Cursor / Claude Desktop,**不要直接改 InputSender**。先看 git 历史里 `99830ee` 和 `6393b0e` 两个 commit — 当时的"标定位置 + cghidEventTap 真实 click"是被 Electron 逼出来的唯一可行解。要扩范围就把那套作为"非终端模式"重新引入,**保留**当前的"终端模式"快路径。
 
 ## UI 注意
 
@@ -62,11 +78,18 @@ macOS 在 app 处于后台时基本不让它处理键盘事件,所以"完全后�
 - header 右上: `⊞` 打开模板库(从 `PromptTemplates.groups` 追加到主网格), `齿轮` 打开 EditorView sheet
 - 卡片右键菜单: 编辑 / 复制 / 上移 / 下移 / 删除
 - 末尾的虚线"+" 卡片: 新增并自动弹编辑 popover; 也是拖到末尾的 drop target
+- targetBar(顶部状态条): 紫色 `lock.fill` + 锁定名 + 🔓 = 锁定模式;绿色 `terminal.fill` + 终端名 + 🔒 = 跟随且在终端;灰色 `terminal` + "焦点不是终端" = 不可发。锁定按钮在 frontmost 是终端时才能按
 
 ## 权限
 
-- **辅助功能**: `CGEvent` 注入 + `AXUIElement` 控制其他 app 必需。每次 `./build.sh install` ad-hoc 重签名后,授权会失效 — 用户要在系统设置里**删掉再加回**(旧授权对的是旧签名 hash)
+- **辅助功能**: `CGEvent.postToPid` 注入必需。每次 `./build.sh install` ad-hoc 重签名后,授权会失效 — 用户要在系统设置里**删掉再加回**(旧授权对的是旧签名 hash)
 - 网络: HTTP server 在 `8765` 端口,纯局域网
+
+## HTTP API(手机遥控)
+
+- `GET /` → Web UI
+- `GET /api/prompts` → `{prompts: [{id, title, content, autoEnter}]}`
+- `POST /api/send` body `{id}` → 焦点不是终端时返回 `409` + 中文说明
 
 ## 用户偏好(从 `~/.claude/CLAUDE.md`)
 

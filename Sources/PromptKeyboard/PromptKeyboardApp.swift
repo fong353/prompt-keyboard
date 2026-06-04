@@ -22,84 +22,114 @@ final class NetworkInfo: ObservableObject {
     }
 }
 
-/// 持有"按按钮要把按键打到哪个进程"的目标 PID + 用户自己标定的输入框位置
-/// 不绑定时按按钮会发给当前 keyWindow(回到默认行为)
-final class BindingState: ObservableObject {
-    @Published var pid: pid_t?
-    @Published var appName: String?
-    @Published var bundleID: String?
+/// 跟踪发送目标。两种模式:
+/// - **跟随**(默认): 目标 = 当前 frontmost,只有 frontmost 是已识别终端时才允许发送
+/// - **锁定**: 用户手动锁了一个终端 pid,之后无论 frontmost 是什么都发到它。发送前如果 frontmost ≠ 锁定 pid,会先 activate() 把它叫到前台,再 postToPid 投递
+///
+/// 锁定的 app 退出时自动解锁。锁定状态不持久化(关 app 重开回到跟随模式)。
+final class TerminalTarget: ObservableObject {
+    // frontmost 持续更新,作为"跟随"模式的来源,也是"是否需要 activate"的判断依据
+    @Published private(set) var frontmostPID: pid_t?
+    @Published private(set) var frontmostName: String?
+    @Published private(set) var frontmostBundleID: String?
 
-    /// 用户标定时点击的绝对屏幕坐标(AX/CG 坐标系,top-left of primary)
-    /// 直接存绝对值,不算窗口相对 offset — 简单可靠,窗口移动了重新标定一次即可
-    @Published var clickPosition: CGPoint?
+    // 锁定状态;nil = 跟随模式
+    @Published private(set) var lockedPID: pid_t?
+    @Published private(set) var lockedName: String?
+    @Published private(set) var lockedBundleID: String?
 
-    /// 是否处于"等待用户在目标输入框点击"的标定模式
-    @Published var isCalibrating: Bool = false
+    /// 已识别的终端 app 白名单。后续要加 Ghostty / WezTerm 等就在这里加 bundle ID。
+    static let terminalBundleIDs: Set<String> = [
+        "com.googlecode.iterm2",   // iTerm2
+        "com.apple.Terminal"       // Apple Terminal
+    ]
 
-    private var calibrationMonitor: Any?
+    var isLocked: Bool { lockedPID != nil }
 
-    var isBound: Bool { pid != nil && clickPosition != nil }
+    /// 实际要 postToPid 投递的 pid
+    var sendPID: pid_t? { lockedPID ?? frontmostPID }
 
-    func unbind() {
-        pid = nil
-        appName = nil
-        bundleID = nil
-        clickPosition = nil
-        cancelCalibration()
+    /// 给 UI 显示的目标名(锁定时是锁定的 app,否则是 frontmost)
+    var displayName: String? { isLocked ? lockedName : frontmostName }
+
+    var displayBundleID: String? { isLocked ? lockedBundleID : frontmostBundleID }
+
+    /// 当前发送目标是不是终端
+    var isTerminal: Bool {
+        guard let bid = displayBundleID else { return false }
+        return Self.terminalBundleIDs.contains(bid)
     }
 
-    /// 启动"标定位置"流程:监听下一次全局 left mouse down,
-    /// 把那一刻的 frontmost app + click 位置存为绑定
-    func startCalibration() {
-        guard !isCalibrating else { return }
-        isCalibrating = true
-        calibrationMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
-            self?.captureClick()
+    /// 当前 frontmost 是终端 → 可以"按它锁定"
+    var canLockCurrent: Bool {
+        guard !isLocked, let bid = frontmostBundleID else { return false }
+        return Self.terminalBundleIDs.contains(bid)
+    }
+
+    init() {
+        refresh()
+        let nc = NSWorkspace.shared.notificationCenter
+        nc.addObserver(self, selector: #selector(activated(_:)),
+                       name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        nc.addObserver(self, selector: #selector(deactivated(_:)),
+                       name: NSWorkspace.didDeactivateApplicationNotification, object: nil)
+        nc.addObserver(self, selector: #selector(appTerminated(_:)),
+                       name: NSWorkspace.didTerminateApplicationNotification, object: nil)
+    }
+
+    func lockCurrent() {
+        guard canLockCurrent else { return }
+        lockedPID = frontmostPID
+        lockedName = frontmostName
+        lockedBundleID = frontmostBundleID
+    }
+
+    func unlock() {
+        lockedPID = nil
+        lockedName = nil
+        lockedBundleID = nil
+    }
+
+    /// 发送前调用。锁定模式 + frontmost ≠ 锁定 app 时,把锁定 app 叫到前台。
+    /// 返回 nil = 可以立即发送;> 0 = 需要等这么久再发(让 activate 生效);返回特殊值 -1 = 锁定 app 已退出,调用方应拒绝发送
+    func prepareForSend() -> TimeInterval? {
+        guard let lpid = lockedPID else { return nil } // 跟随模式直接发
+        guard let app = NSRunningApplication(processIdentifier: lpid) else {
+            unlock()
+            return -1
         }
-    }
-
-    func cancelCalibration() {
-        if let m = calibrationMonitor {
-            NSEvent.removeMonitor(m)
-            calibrationMonitor = nil
+        if frontmostPID != lpid {
+            app.activate()
+            return 0.15
         }
-        isCalibrating = false
+        return nil
     }
 
-    /// 把 click 当时的 frontmost app + 屏幕位置存为绑定
-    private func captureClick() {
-        // 这一刻先抓鼠标位置 — NSEvent 坐标系是 bottom-left origin of primary screen
-        let mouseLocBL = NSEvent.mouseLocation
-        cancelCalibration()
+    @objc private func activated(_ note: Notification) {
+        DispatchQueue.main.async { self.refresh() }
+    }
 
-        // 等 100ms 让 click 真的把 target app 切前台,再读 frontmost
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            guard let self = self,
-                  let app = NSWorkspace.shared.frontmostApplication,
-                  app.bundleIdentifier != Bundle.main.bundleIdentifier
+    @objc private func deactivated(_ note: Notification) {
+        DispatchQueue.main.async { self.refresh() }
+    }
+
+    @objc private func appTerminated(_ note: Notification) {
+        DispatchQueue.main.async {
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  app.processIdentifier == self.lockedPID
             else { return }
-
-            // NSEvent BL → CG/AX TL — 用 CGMainDisplayID 拿 primary screen 高度,
-            // NSScreen.main 在多屏 / 当前 key window 不在 primary 时可能给错的屏
-            let primaryHeight = CGDisplayBounds(CGMainDisplayID()).height
-            let mouseLocTL = CGPoint(x: mouseLocBL.x, y: primaryHeight - mouseLocBL.y)
-
-            self.pid = app.processIdentifier
-            self.appName = app.localizedName
-            self.bundleID = app.bundleIdentifier
-            self.clickPosition = mouseLocTL
+            self.unlock()
         }
     }
 
-    /// 绑定的进程是否还活着,死了清掉绑定并返回 false
-    @discardableResult
-    func validate() -> Bool {
-        guard let p = pid else { return false }
-        if NSRunningApplication(processIdentifier: p) == nil {
-            unbind()
-            return false
-        }
-        return true
+    private func refresh() {
+        // 自己不算 frontmost — 自己被激活时保留之前的记录
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.bundleIdentifier != Bundle.main.bundleIdentifier
+        else { return }
+        self.frontmostPID = app.processIdentifier
+        self.frontmostName = app.localizedName
+        self.frontmostBundleID = app.bundleIdentifier
     }
 }
 
@@ -107,7 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var panel: FloatingPanel?
     let store = PromptStore()
     let network = NetworkInfo()
-    let binding = BindingState()
+    let target = TerminalTarget()
     var server: HTTPServer?
     let httpPort: UInt16 = 8765
 
@@ -119,7 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let content = ContentView()
             .environmentObject(store)
             .environmentObject(network)
-            .environmentObject(binding)
+            .environmentObject(target)
 
         let hosting = NSHostingView(rootView: content)
         let panel = FloatingPanel(
@@ -200,28 +230,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             else { return .badRequest() }
 
             var found: Prompt?
-            var targetPID: pid_t?
-            var targetPosition: CGPoint?
-            var bindAlive = true
+            var pid: pid_t?
+            var isTerm = false
+            var displayName: String?
             DispatchQueue.main.sync {
                 found = self.store.prompts.first { $0.id == id }
-                if self.binding.isBound {
-                    bindAlive = self.binding.validate()
-                    targetPID = self.binding.pid
-                    targetPosition = self.binding.clickPosition
-                }
+                pid = self.target.sendPID
+                isTerm = self.target.isTerminal
+                displayName = self.target.displayName
             }
             guard let prompt = found else { return .notFound() }
-            if !bindAlive {
+            guard isTerm, let targetPID = pid else {
+                let msg = "当前焦点不是终端 (\(displayName ?? "无"))。请先锁定一个终端,或切到 iTerm2 / Terminal"
                 return HTTPResponse(
                     status: 409, statusText: "Conflict",
                     headers: ["Content-Type": "text/plain; charset=utf-8"],
-                    body: Data("绑定的进程已退出,请在 Mac 端重新绑定".utf8)
+                    body: Data(msg.utf8)
                 )
             }
 
             DispatchQueue.main.async {
-                InputSender.send(prompt.content, autoEnter: prompt.autoEnter, toPID: targetPID, clickPosition: targetPosition)
+                let delay = self.target.prepareForSend()
+                if delay == -1 {
+                    // 锁定 app 已退出,prepareForSend 已自动解锁;本次直接放弃
+                    return
+                }
+                let after = delay ?? 0
+                DispatchQueue.main.asyncAfter(deadline: .now() + after) {
+                    InputSender.send(prompt.content, autoEnter: prompt.autoEnter, toPID: targetPID)
+                }
             }
             return .json(["ok": true])
 
@@ -232,7 +269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 /// 不抢焦点的悬浮 Panel:这样点击我们窗口的按钮时,
-/// 系统的 keyWindow 仍然是用户之前的终端窗口,⌘V 才能粘到目标里
+/// 系统的 frontmost 仍然是用户之前的终端窗口,⌘V 才能粘到目标里
 final class FloatingPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }

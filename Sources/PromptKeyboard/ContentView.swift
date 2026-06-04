@@ -5,14 +5,14 @@ import CoreImage.CIFilterBuiltins
 struct ContentView: View {
     @EnvironmentObject var store: PromptStore
     @EnvironmentObject var network: NetworkInfo
-    @EnvironmentObject var binding: BindingState
+    @EnvironmentObject var target: TerminalTarget
     @State private var showEditor = false
     @State private var showQR = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
-            bindingBar
+            targetBar
             Divider()
             buttonGrid
             Divider()
@@ -50,56 +50,46 @@ struct ContentView: View {
         .padding(.bottom, 4)
     }
 
-    private var bindingBar: some View {
+    private var targetBar: some View {
         HStack(spacing: 6) {
-            if binding.isCalibrating {
-                Image(systemName: "scope")
-                    .foregroundStyle(.orange)
-                Text("到目标输入框里点一下…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    binding.cancelCalibration()
-                } label: {
-                    Text("取消").font(.caption)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            } else if binding.isBound {
-                Image(systemName: "scope")
-                    .foregroundStyle(.green)
-                Text(binding.appName ?? "")
+            if target.isLocked {
+                Image(systemName: "lock.fill")
+                    .foregroundStyle(.purple)
+                Text("锁定 → \(target.displayName ?? "")")
                     .font(.caption)
                     .fontWeight(.medium)
                     .lineLimit(1)
-                Text("PID \(binding.pid ?? 0)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
                 Spacer()
                 Button {
-                    binding.unbind()
+                    target.unlock()
                 } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
+                    Image(systemName: "lock.open")
                 }
                 .buttonStyle(.borderless)
-                .help("解绑")
-            } else {
-                Image(systemName: "scope")
-                    .foregroundStyle(.secondary)
-                Text("未绑定 · 发送到当前焦点窗口")
+                .help("解锁,回到跟随当前焦点模式")
+            } else if target.isTerminal {
+                Image(systemName: "terminal.fill")
+                    .foregroundStyle(.green)
+                Text("→ \(target.displayName ?? "")")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
                 Spacer()
                 Button {
-                    binding.startCalibration()
+                    target.lockCurrent()
                 } label: {
-                    Text("标定位置").font(.caption)
+                    Image(systemName: "lock")
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("点这里后,到目标 App 的输入框里点一下 — PromptKeyboard 会记下那个位置")
+                .buttonStyle(.borderless)
+                .help("锁定到当前终端 — 之后无论切到哪个 app,发送都会回到这里(自动叫前台)")
+            } else {
+                Image(systemName: "terminal")
+                    .foregroundStyle(.secondary)
+                Text(target.displayName.map { "焦点不是终端 (\($0))" } ?? "无焦点应用")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
             }
         }
         .padding(.horizontal, 12)
@@ -113,7 +103,7 @@ struct ContentView: View {
                 spacing: 6
             ) {
                 ForEach(store.prompts) { prompt in
-                    PromptButton(prompt: prompt, binding: binding)
+                    PromptButton(prompt: prompt, target: target)
                 }
                 AddCardButton()
             }
@@ -189,7 +179,7 @@ private struct QRView: View {
 
 private struct PromptButton: View {
     let prompt: Prompt
-    @ObservedObject var binding: BindingState
+    @ObservedObject var target: TerminalTarget
     @EnvironmentObject var store: PromptStore
     @State private var flashed = false
     @State private var error = false
@@ -212,15 +202,21 @@ private struct PromptButton: View {
                 }
 
             Button {
-                // 绑定的进程死了就拒绝发送并红闪一下
-                if binding.isBound && !binding.validate() {
-                    withAnimation(.easeOut(duration: 0.12)) { error = true }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                        withAnimation(.easeIn(duration: 0.2)) { error = false }
-                    }
+                // 目标不是已识别的终端 → 红闪拒绝
+                guard target.isTerminal, let pid = target.sendPID else {
+                    flashError()
                     return
                 }
-                InputSender.send(prompt.content, autoEnter: prompt.autoEnter, toPID: binding.pid, clickPosition: binding.clickPosition)
+                // 锁定模式 + frontmost ≠ 锁定 app → 先 activate,等 0.15s 再发
+                let delay = target.prepareForSend()
+                if delay == -1 {
+                    flashError() // 锁定 app 已退出,prepareForSend 自动解锁
+                    return
+                }
+                let after = delay ?? 0
+                DispatchQueue.main.asyncAfter(deadline: .now() + after) {
+                    InputSender.send(prompt.content, autoEnter: prompt.autoEnter, toPID: pid)
+                }
                 withAnimation(.easeOut(duration: 0.12)) { flashed = true }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                     withAnimation(.easeIn(duration: 0.18)) { flashed = false }
@@ -260,10 +256,19 @@ private struct PromptButton: View {
         }
     }
 
+    private func flashError() {
+        withAnimation(.easeOut(duration: 0.12)) { error = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            withAnimation(.easeIn(duration: 0.2)) { error = false }
+        }
+    }
+
     private var helpText: String {
         var s = prompt.content
         if prompt.autoEnter { s += "\n(自动回车)" }
-        if let name = binding.appName { s += "\n→ \(name)" }
+        if target.isTerminal, let name = target.displayName {
+            s += target.isLocked ? "\n🔒 → \(name)" : "\n→ \(name)"
+        }
         s += "\n(右键编辑)"
         return s
     }
