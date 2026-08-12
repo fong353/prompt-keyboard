@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 给后续 Claude Code 编辑这个项目的快速上手 + 踩坑总结。
 
